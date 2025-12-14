@@ -549,7 +549,7 @@ const BiometricsStep: React.FC<{ onComplete: () => void }> = ({ onComplete }) =>
 };
 
 const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete, onJoinFamily, onExploreAsGuest }) => {
-    const { t } = useTranslation();
+    const { t, i18n } = useTranslation();
     const [view, setView] = useState<'welcome' | 'accountType' | 'lifestyleQuiz' | 'personal' | 'joinFamily' | 'terms' | 'biometrics' | 'loginEmail'>('welcome');
     const [pendingData, setPendingData] = useState<Partial<OnboardingData>>({});
     const [accountPlan, setAccountPlan] = useState<'single' | 'family'>('single');
@@ -729,7 +729,7 @@ const OnboardingScreen: React.FC<OnboardingScreenProps> = ({ onComplete, onJoinF
                 isOpen={langOpen}
                 title={t('settings.modals.selectLanguage')}
                 items={AVAILABLE_LANGUAGES.map(l => ({ key: l.code, label: l.nameEn }))}
-                initialSelectedKey={(i18n as any).language}
+                initialSelectedKey={i18n.language || 'en'}
                 onClose={() => setLangOpen(false)}
                 onSelect={(code) => {
                     i18n.changeLanguage(code);

@@ -2,6 +2,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const crypto = require('crypto');
 require('dotenv').config();
 
 const app = express();
@@ -41,7 +42,7 @@ const allowedOrigins = new Set([
 app.use(cors({
   origin: Array.from(allowedOrigins),
   methods: ['GET', 'POST', 'OPTIONS'],
-  credentials: false
+  credentials: true
 }));
 
 async function getAccessToken() {
@@ -103,6 +104,11 @@ const PROMO_CODES_FILE = path.join(__dirname, 'data', 'promo-codes.json');
 const PROMO_USAGE_FILE = path.join(__dirname, 'data', 'promo-usage.json');
 const USERS_FILE = path.join(__dirname, 'data', 'users.json');
 const WEBVIEW_CLICKS_FILE = path.join(__dirname, 'data', 'webview-clicks.json');
+const SESSIONS_FILE = path.join(__dirname, 'data', 'sessions.json');
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const FACEBOOK_APP_ID = process.env.FACEBOOK_APP_ID || '';
+const FACEBOOK_APP_SECRET = process.env.FACEBOOK_APP_SECRET || '';
+const APPLE_CLIENT_ID = process.env.APPLE_CLIENT_ID || '';
 
 function seedDefaultPromoCodes() {
   const codes = loadJson(PROMO_CODES_FILE, []);
@@ -391,6 +397,235 @@ app.post('/api/paypal/webhook', async (req, res) => {
 
 app.get('/api/health', (_req, res) => res.json({ ok: true, env: PAYPAL_ENV, hasCredentials: HAS_CREDENTIALS }));
 
+function setSessionCookie(res, id) {
+  const secure = PAYPAL_ENV === 'live' || CLIENT_BASE_URL.startsWith('https://');
+  const maxAge = 30 * 24 * 60 * 60;
+  const parts = [
+    `venty_session=${id}`,
+    'Path=/',
+    `Max-Age=${maxAge}`,
+    'HttpOnly',
+    'SameSite=Lax'
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+}
+function parseCookie(req) {
+  const h = req.headers.cookie || '';
+  const out = {};
+  h.split(';').forEach(p => {
+    const i = p.indexOf('=');
+    if (i > -1) out[p.slice(0, i).trim()] = decodeURIComponent(p.slice(i + 1).trim());
+  });
+  return out;
+}
+function upsertUserFromIdentity(identity) {
+  const users = loadJson(USERS_FILE, []);
+  const { provider, providerId, email, name, picture } = identity;
+  let user = users.find(u => (u.providers || []).some(p => p.provider === provider && p.providerId === providerId) || (email && u.email && u.email.toLowerCase() === email.toLowerCase()));
+  if (!user) {
+    user = { userId: `${provider}:${providerId}`, email: email || '', name: name || '', providers: [{ provider, providerId, email, picture }], createdAt: new Date().toISOString(), passwordHash: null, passwordSalt: null };
+    users.push(user);
+  } else {
+    const has = (user.providers || []).some(p => p.provider === provider && p.providerId === providerId);
+    if (!has) {
+      user.providers = [...(user.providers || []), { provider, providerId, email, picture }];
+    }
+    if (email && !user.email) user.email = email;
+    if (name && !user.name) user.name = name;
+    if (picture) {
+      user.providers = (user.providers || []).map(p => p.provider === provider && p.providerId === providerId ? { ...p, picture } : p);
+    }
+  }
+  saveJson(USERS_FILE, users);
+  return user;
+}
+function createSession(userId) {
+  const sessions = loadJson(SESSIONS_FILE, []);
+  const id = Math.random().toString(36).slice(2) + Math.random().toString(36).slice(2);
+  const expiresAt = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString();
+  sessions.unshift({ id, userId, expiresAt, createdAt: new Date().toISOString() });
+  saveJson(SESSIONS_FILE, sessions.slice(0, 1000));
+  return id;
+}
+function getSession(sessionId) {
+  const sessions = loadJson(SESSIONS_FILE, []);
+  const s = sessions.find(x => x.id === sessionId);
+  if (!s) return null;
+  if (new Date(s.expiresAt).getTime() < Date.now()) return null;
+  return s;
+}
+app.get('/api/auth/me', (req, res) => {
+  const cookies = parseCookie(req);
+  const sid = cookies['venty_session'];
+  if (!sid) return res.json({ ok: false });
+  const s = getSession(sid);
+  if (!s) return res.json({ ok: false });
+  const users = loadJson(USERS_FILE, []);
+  const user = users.find(u => u.userId === s.userId) || null;
+  if (!user) return res.json({ ok: false });
+  res.json({ ok: true, user });
+});
+app.post('/api/auth/logout', (req, res) => {
+  const secure = PAYPAL_ENV === 'live' || CLIENT_BASE_URL.startsWith('https://');
+  const parts = [
+    'venty_session=',
+    'Path=/',
+    'Max-Age=0',
+    'HttpOnly',
+    'SameSite=Lax'
+  ];
+  if (secure) parts.push('Secure');
+  res.setHeader('Set-Cookie', parts.join('; '));
+  res.json({ ok: true });
+});
+app.post('/api/auth/session/google', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ ok: false, error: 'missing_id_token' });
+    const tokeninfo = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    const info = await tokeninfo.json();
+    if (!tokeninfo.ok) return res.status(401).json({ ok: false, error: 'invalid_token' });
+    if (GOOGLE_CLIENT_ID && info.aud !== GOOGLE_CLIENT_ID) return res.status(401).json({ ok: false, error: 'aud_mismatch' });
+    const identity = { provider: 'google', providerId: info.sub, email: info.email, name: info.name };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+app.post('/api/auth/session/facebook', async (req, res) => {
+  try {
+    const { accessToken } = req.body || {};
+    if (!accessToken) return res.status(400).json({ ok: false, error: 'missing_access_token' });
+    if (FACEBOOK_APP_ID && FACEBOOK_APP_SECRET) {
+      const appToken = `${FACEBOOK_APP_ID}|${FACEBOOK_APP_SECRET}`;
+      const dbg = await fetch(`https://graph.facebook.com/debug_token?input_token=${encodeURIComponent(accessToken)}&access_token=${encodeURIComponent(appToken)}`);
+      const dbgData = await dbg.json();
+      if (!dbg.ok || !dbgData?.data?.is_valid) return res.status(401).json({ ok: false, error: 'invalid_token' });
+    }
+    const meRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email&access_token=${encodeURIComponent(accessToken)}`);
+    const me = await meRes.json();
+    if (!meRes.ok) return res.status(401).json({ ok: false, error: 'profile_error' });
+    const identity = { provider: 'facebook', providerId: me.id, email: me.email, name: me.name };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch {
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+app.post('/api/auth/session/apple', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ ok: false, error: 'missing_id_token' });
+    const mod = await import('jose');
+    const JWKS = mod.createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+    const { payload } = await mod.jwtVerify(idToken, JWKS, { issuer: 'https://appleid.apple.com', audience: APPLE_CLIENT_ID || undefined });
+    const identity = { provider: 'apple', providerId: payload.sub, email: payload.email, name: '' };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch {
+    res.status(401).json({ ok: false, error: 'invalid_token' });
+  }
+});
+
+app.post('/api/auth/google', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ ok: false, error: 'missing_id_token' });
+    const tokeninfo = await fetch(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`);
+    const info = await tokeninfo.json();
+    if (!tokeninfo.ok) return res.status(401).json({ ok: false, error: 'invalid_token' });
+    if (GOOGLE_CLIENT_ID && info.aud !== GOOGLE_CLIENT_ID) return res.status(401).json({ ok: false, error: 'aud_mismatch' });
+    const identity = { provider: 'google', providerId: info.sub, email: info.email, name: info.name, picture: info.picture };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch (e) {
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+app.post('/api/auth/facebook', async (req, res) => {
+  try {
+    const { accessToken } = req.body || {};
+    if (!accessToken) return res.status(400).json({ ok: false, error: 'missing_access_token' });
+    if (FACEBOOK_APP_ID && FACEBOOK_APP_SECRET) {
+      const appToken = `${FACEBOOK_APP_ID}|${FACEBOOK_APP_SECRET}`;
+      const dbg = await fetch(`https://graph.facebook.com/debug_token?input_token=${encodeURIComponent(accessToken)}&access_token=${encodeURIComponent(appToken)}`);
+      const dbgData = await dbg.json();
+      if (!dbg.ok || !dbgData?.data?.is_valid) return res.status(401).json({ ok: false, error: 'invalid_token' });
+    }
+    const meRes = await fetch(`https://graph.facebook.com/me?fields=id,name,email,picture.type(large)&access_token=${encodeURIComponent(accessToken)}`);
+    const me = await meRes.json();
+    if (!meRes.ok) return res.status(401).json({ ok: false, error: 'profile_error' });
+    const identity = { provider: 'facebook', providerId: me.id, email: me.email, name: me.name, picture: me?.picture?.data?.url };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch {
+    res.status(500).json({ ok: false, error: 'server_error' });
+  }
+});
+app.post('/api/auth/apple', async (req, res) => {
+  try {
+    const { idToken } = req.body || {};
+    if (!idToken) return res.status(400).json({ ok: false, error: 'missing_id_token' });
+    const mod = await import('jose');
+    const JWKS = mod.createRemoteJWKSet(new URL('https://appleid.apple.com/auth/keys'));
+    const { payload } = await mod.jwtVerify(idToken, JWKS, { issuer: 'https://appleid.apple.com', audience: APPLE_CLIENT_ID || undefined });
+    const identity = { provider: 'apple', providerId: payload.sub, email: payload.email, name: '' };
+    const user = upsertUserFromIdentity(identity);
+    const sid = createSession(user.userId);
+    setSessionCookie(res, sid);
+    res.json({ ok: true, user });
+  } catch {
+    res.status(401).json({ ok: false, error: 'invalid_token' });
+  }
+});
+function isValidEmailAddress(email) {
+  return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').toLowerCase());
+}
+function hashPassword(password, salt) {
+  const h = crypto.scryptSync(String(password), String(salt), 64);
+  return h.toString('hex');
+}
+app.post('/api/auth/email/signup', (req, res) => {
+  const { email, password } = req.body || {};
+  if (!isValidEmailAddress(email)) return res.status(400).json({ ok: false, error: 'invalid_email' });
+  if (!password || String(password).length < 8) return res.status(400).json({ ok: false, error: 'weak_password' });
+  const users = loadJson(USERS_FILE, []);
+  const existing = users.find(u => u.email && u.email.toLowerCase() === String(email).toLowerCase());
+  if (existing) return res.status(409).json({ ok: false, error: 'email_exists' });
+  const salt = crypto.randomBytes(16).toString('hex');
+  const passwordHash = hashPassword(password, salt);
+  const userId = `user_${Math.random().toString(36).slice(2)}`;
+  const user = { userId, email, name: '', providers: [], createdAt: new Date().toISOString(), passwordHash, passwordSalt: salt };
+  users.push(user);
+  saveJson(USERS_FILE, users);
+  const sid = createSession(user.userId);
+  setSessionCookie(res, sid);
+  res.json({ ok: true, user });
+});
+app.post('/api/auth/email/login', (req, res) => {
+  const { email, password } = req.body || {};
+  if (!isValidEmailAddress(email) || !password) return res.status(400).json({ ok: false, error: 'invalid_credentials' });
+  const users = loadJson(USERS_FILE, []);
+  const user = users.find(u => u.email && u.email.toLowerCase() === String(email).toLowerCase());
+  if (!user || !user.passwordHash || !user.passwordSalt) return res.status(401).json({ ok: false, error: 'invalid_credentials' });
+  const calc = hashPassword(password, user.passwordSalt);
+  if (calc !== user.passwordHash) return res.status(401).json({ ok: false, error: 'invalid_credentials' });
+  const sid = createSession(user.userId);
+  setSessionCookie(res, sid);
+  res.json({ ok: true, user });
+});
 // --- Basic user profile storage (country/currency) ---
 app.post('/api/users/:userId/profile', (req, res) => {
   const { userId } = req.params;

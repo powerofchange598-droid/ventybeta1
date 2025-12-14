@@ -52,19 +52,48 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     if (!a) return;
     return onAuthStateChanged(a, (u) => setUser(u));
   }, []);
+  useEffect(() => {
+    let canceled = false;
+    (async () => {
+      try {
+        const r = await fetch('/api/auth/me', { credentials: 'include' });
+        const data = await r.json();
+        if (!canceled && data?.ok && data.user) {
+          const u = makeFakeUser(data.user.email || '', data.user.name || '');
+          (u as any).uid = data.user.userId || (u as any).uid;
+          setUser(u);
+        }
+      } catch {}
+    })();
+    return () => { canceled = true; };
+  }, []);
 
   const signInWithGoogle = async () => {
     try {
       const provider = new GoogleAuthProvider();
       const a = getAuth();
-      if (!a) {
-        const fake = makeFakeUser('user@google.local', 'Google User');
-        setUser(fake);
-        return fake;
-      }
+      if (!a) return null;
       const res = await signInWithPopup(a, provider);
-      setUser(res.user);
-      return res.user;
+      const cred = GoogleAuthProvider.credentialFromResult(res);
+      const idToken = cred?.idToken;
+      if (!idToken) {
+        setUser(null);
+        return null;
+      }
+      const r = await fetch('/api/auth/session/google', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ idToken }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data?.ok) {
+        setUser(null);
+        return null;
+      }
+      const u = makeFakeUser(data.user?.email || res.user.email || '', data.user?.name || res.user.displayName || '');
+      setUser(u);
+      return u;
     } catch {
       return null;
     }
@@ -74,14 +103,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const provider = new FacebookAuthProvider();
       const a = getAuth();
-      if (!a) {
-        const fake = makeFakeUser('user@facebook.local', 'Facebook User');
-        setUser(fake);
-        return fake;
-      }
+      if (!a) return null;
       const res = await signInWithPopup(a, provider);
-      setUser(res.user);
-      return res.user;
+      const cred = FacebookAuthProvider.credentialFromResult(res) as any;
+      const accessToken = cred?.accessToken;
+      if (!accessToken) {
+        setUser(null);
+        return null;
+      }
+      const r = await fetch('/api/auth/session/facebook', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ accessToken }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data?.ok) {
+        setUser(null);
+        return null;
+      }
+      const u = makeFakeUser(data.user?.email || res.user.email || '', data.user?.name || res.user.displayName || '');
+      setUser(u);
+      return u;
     } catch {
       return null;
     }
@@ -91,14 +134,28 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
     try {
       const provider = new OAuthProvider('apple.com');
       const a = getAuth();
-      if (!a) {
-        const fake = makeFakeUser('user@apple.local', 'Apple User');
-        setUser(fake);
-        return fake;
-      }
+      if (!a) return null;
       const res = await signInWithPopup(a, provider);
-      setUser(res.user);
-      return res.user;
+      const cred = OAuthProvider.credentialFromResult(res) as any;
+      const idToken = cred?.idToken;
+      if (!idToken) {
+        setUser(null);
+        return null;
+      }
+      const r = await fetch('/api/auth/session/apple', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ idToken }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data?.ok) {
+        setUser(null);
+        return null;
+      }
+      const u = makeFakeUser(data.user?.email || res.user.email || '', data.user?.name || res.user.displayName || '');
+      setUser(u);
+      return u;
     } catch {
       return null;
     }
@@ -106,19 +163,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signUpWithEmail = async (email: string, password: string) => {
     try {
-      const a = getAuth();
-      if (!a) {
-        if (!isValidEmail(email) || (password || '').length < 8) return null;
-        const users = getLocalUsers();
-        users[email] = { password };
-        setLocalUsers(users);
-        const fake = makeFakeUser(email);
-        setUser(fake);
-        return fake;
-      }
-      const res = await createUserWithEmailAndPassword(a, email, password);
-      setUser(res.user);
-      return res.user;
+      const r = await fetch('/api/auth/email/signup', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data?.ok) return null;
+      const u = makeFakeUser(data.user?.email || email, data.user?.name || '');
+      (u as any).uid = data.user?.userId || (u as any).uid;
+      setUser(u);
+      return u;
     } catch {
       return null;
     }
@@ -126,20 +182,18 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signInWithEmail = async (email: string, password: string) => {
     try {
-      const a = getAuth();
-      if (!a) {
-        const users = getLocalUsers();
-        if (!isValidEmail(email)) return null;
-        if (users[email] && users[email].password === password) {
-          const fake = makeFakeUser(email);
-          setUser(fake);
-          return fake;
-        }
-        return null;
-      }
-      const res = await signInWithEmailAndPassword(a, email, password);
-      setUser(res.user);
-      return res.user;
+      const r = await fetch('/api/auth/email/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await r.json();
+      if (!r.ok || !data?.ok) return null;
+      const u = makeFakeUser(data.user?.email || email, data.user?.name || '');
+      (u as any).uid = data.user?.userId || (u as any).uid;
+      setUser(u);
+      return u;
     } catch {
       return null;
     }
@@ -147,8 +201,13 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const signOutFn = async () => {
     const a = getAuth();
-    if (!a) return;
-    await signOut(a);
+    try {
+      await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' });
+    } catch {}
+    if (a) {
+      await signOut(a);
+    }
+    setUser(null);
   };
 
   const value = useMemo(() => ({
